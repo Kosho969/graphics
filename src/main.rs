@@ -1,241 +1,219 @@
-// main.rs
-#![allow(unused_imports)]
-#![allow(dead_code)]
-
-mod line;
-mod framebuffer;
-mod maze;
-mod caster;
-mod player;
-mod textures;
-
-use line::line;
-use maze::{Maze, load_maze};
-use caster::{cast_ray, Intersect};
-use framebuffer::Framebuffer;
-use player::{Player, process_events};
-use textures::TextureManager;
-
-use raylib::prelude::*;
-use std::thread;
+use nalgebra_glm::{Vec3, normalize};
+use minifb::{Key, Window, WindowOptions};
 use std::time::Duration;
 use std::f32::consts::PI;
-mod enemy;
-use enemy::{Enemy};
 
-const TRANSPARENT_COLOR: Color = Color::new(152, 0, 136, 255);
+mod framebuffer;
+mod ray_intersect;
+mod sphere; 
+mod color;
+mod camera;
+mod light;
+mod material;
 
-fn draw_sprite(
-    framebuffer: &mut Framebuffer,
-    player: &Player,
-    enemy: &Enemy,
-    texture_manager: &TextureManager
-) {
-    // Calculate angle from player to enemy
-    let sprite_a = (enemy.pos.y - player.pos.y).atan2(enemy.pos.x - player.pos.x);
+use framebuffer::Framebuffer;
+use sphere::Sphere;
+use color::Color;
+use ray_intersect::{Intersect, RayIntersect};
+use camera::Camera;
+use light::Light;
+use material::Material;
 
-    // Normalize angle difference to [-PI, PI]
-    let mut angle_diff = sprite_a - player.a;
-    while angle_diff > std::f32::consts::PI {
-        angle_diff -= 2.0 * std::f32::consts::PI;
+const SHADOW_BIAS: f32 = 1e-4;
+
+fn reflect(incident: &Vec3, normal: &Vec3) -> Vec3 {
+    incident - 2.0 * incident.dot(normal) * normal
+}
+
+fn cast_shadow(
+    intersect: &Intersect,
+    light: &Light,
+    objects: &[Sphere],
+) -> f32 {
+    let light_dir = (light.position - intersect.point).normalize();
+    let light_distance = (light.position - intersect.point).magnitude();
+
+    let offset_normal = intersect.normal * SHADOW_BIAS;
+    let shadow_ray_origin = if light_dir.dot(&intersect.normal) < 0.0 {
+        intersect.point - offset_normal
+    } else {
+        intersect.point + offset_normal
+    };
+
+    let mut shadow_intensity = 0.0;
+
+    for object in objects {
+        let shadow_intersect = object.ray_intersect(&shadow_ray_origin, &light_dir);
+        if shadow_intersect.is_intersecting && shadow_intersect.distance < light_distance {
+            let distance_ratio = shadow_intersect.distance / light_distance;
+            shadow_intensity = 1.0 - distance_ratio.powf(2.0).min(1.0);
+            break;
+        }
     }
-    while angle_diff < -std::f32::consts::PI {
-        angle_diff += 2.0 * std::f32::consts::PI;
+
+    shadow_intensity
+}
+
+pub fn cast_ray(
+    ray_origin: &Vec3,
+    ray_direction: &Vec3,
+    objects: &[Sphere],
+    light: &Light,
+) -> Color {
+    let mut intersect = Intersect::empty();
+    let mut zbuffer = f32::INFINITY;
+
+    for object in objects {
+        let i = object.ray_intersect(ray_origin, ray_direction);
+        if i.is_intersecting && i.distance < zbuffer {
+            zbuffer = i.distance;
+            intersect = i;
+        }
     }
 
-    // If enemy is outside player's FOV, skip drawing
-    if angle_diff.abs() > player.fov / 2.0 {
-        return;
+    if !intersect.is_intersecting {
+        // return default sky box color
+        return Color::new(4, 12, 36);
     }
 
-    // Distance from player to enemy
-    let sprite_d = ((player.pos.x - enemy.pos.x).powi(2) + (player.pos.y - enemy.pos.y).powi(2)).sqrt();
+    let light_dir = (light.position - intersect.point).normalize();
+    let view_dir = (ray_origin - intersect.point).normalize();
+    let reflect_dir = reflect(&-light_dir, &intersect.normal);
 
-    if sprite_d < 50.0 || sprite_d > 1000.0 {
-        return;
-    }
+    let shadow_intensity = cast_shadow(&intersect, light, objects);
+    let light_intensity = light.intensity * (1.0 - shadow_intensity);
 
-    let screen_height = framebuffer.height as f32;
-    let screen_width = framebuffer.width as f32;
+    let diffuse_intensity = intersect.normal.dot(&light_dir).max(0.0).min(1.0);
+    let diffuse = intersect.material.diffuse * intersect.material.albedo[0] * diffuse_intensity * light_intensity;
 
-    // Calculate sprite size on screen (scale inversely proportional to distance)
-    let sprite_size = (screen_height / sprite_d) * 70.0;
+    let specular_intensity = view_dir.dot(&reflect_dir).max(0.0).powf(intersect.material.specular);
+    let specular = light.color * intersect.material.albedo[1] * specular_intensity * light_intensity;
 
-    // Calculate horizontal screen position (centered)
-    let screen_x = ((angle_diff / player.fov) + 0.5) * screen_width;
+    diffuse + specular
+}
 
-    // Calculate top-left corner of sprite on screen
-    let start_x = (screen_x - sprite_size / 2.0).max(0.0) as usize;
-    let start_y = (screen_height / 2.0 - sprite_size / 2.0).max(0.0) as usize;
+pub fn render(framebuffer: &mut Framebuffer, objects: &[Sphere], camera: &Camera, light: &Light) {
+    let width = framebuffer.width as f32;
+    let height = framebuffer.height as f32;
+    let aspect_ratio = width / height;
+    let fov = PI/3.0;
+    let perspective_scale = (fov * 0.5).tan();
 
-    let sprite_size_usize = sprite_size as usize;
+    // random number generator
+    // let mut rng = rand::thread_rng();
 
-    let end_x = (start_x + sprite_size_usize).min(framebuffer.width as usize);
-    let end_y = (start_y + sprite_size_usize).min(framebuffer.height as usize);
+    for y in 0..framebuffer.height {
+        for x in 0..framebuffer.width {
+            // if rng.gen_range(0.0..1.0) < 0.3 {
+            //     // we skip 30% of the points
+            //     continue;
+            // }
 
-    for x in start_x..end_x {
-        for y in start_y..end_y {
-            // Map screen pixel to texture coordinates (assuming 128x128 texture)
-            let tx = ((x - start_x) * 128 / sprite_size_usize) as u32;
-            let ty = ((y - start_y) * 128 / sprite_size_usize) as u32;
+            // Map the pixel coordinate to screen space [-1, 1]
+            let screen_x = (2.0 * x as f32) / width - 1.0;
+            let screen_y = -(2.0 * y as f32) / height + 1.0;
 
-            let color = texture_manager.get_pixel_color('e', tx, ty);
+            // Adjust for aspect ratio and perspective 
+            let screen_x = screen_x * aspect_ratio * perspective_scale;
+            let screen_y = screen_y * perspective_scale;
 
-            // Skip transparent pixels
-            if color != TRANSPARENT_COLOR {
-                framebuffer.set_current_color(color);
-                framebuffer.set_pixel(x as u32, y as u32);
-            }
+            // Calculate the direction of the ray for this pixel
+            let ray_direction = normalize(&Vec3::new(screen_x, screen_y, -1.0));
+
+            // Apply camera rotation to the ray direction
+            let rotated_direction = camera.basis_change(&ray_direction);
+
+            // Cast the ray and get the pixel color
+            let pixel_color = cast_ray(&camera.eye, &rotated_direction, objects, light);
+
+            // Draw the pixel on screen with the returned color
+            framebuffer.set_current_color(pixel_color.to_hex());
+            framebuffer.point(x, y);
         }
     }
 }
 
-
-fn draw_cell(
-  framebuffer: &mut Framebuffer,
-  xo: usize,
-  yo: usize,
-  block_size: usize,
-  cell: char,
-) {
-  if cell == ' ' {
-    return;
-  }
-  framebuffer.set_current_color(Color::WHITE);
-
-  for x in xo..xo + block_size {
-    for y in yo..yo + block_size {
-      framebuffer.set_pixel(x as u32, y as u32);
-    }
-  }
-}
-
-pub fn render_maze(
-  framebuffer: &mut Framebuffer,
-  maze: &Maze,
-  block_size: usize,
-  player: &Player,
-) {
-  for (row_index, row) in maze.iter().enumerate() {
-    for (col_index, &cell) in row.iter().enumerate() {
-      let xo = col_index * block_size;
-      let yo = row_index * block_size;
-      draw_cell(framebuffer, xo, yo, block_size, cell);
-    }
-  }
-
-  framebuffer.set_current_color(Color::WHITESMOKE);
-
-  let num_rays = 5;
-  for i in 0..num_rays {
-    let current_ray = i as f32 / num_rays as f32;
-    let a = player.a - (player.fov / 2.0) + (player.fov * current_ray);
-    cast_ray(framebuffer, &maze, &player, a, block_size, true);
-  }
-}
-
-fn render_world(
-  framebuffer: &mut Framebuffer,
-  maze: &Maze,
-  block_size: usize,
-  player: &Player,
-  texture_cache: &TextureManager,
-) {
-  let num_rays = framebuffer.width;
-  let hh = framebuffer.height as f32 / 2.0;
-
-  // Draw sky and floor
-  for i in 0..framebuffer.width {
-    framebuffer.set_current_color(Color::SKYBLUE);
-    for j in 0..(framebuffer.height / 2) {
-      framebuffer.set_pixel(i, j);
-    }
-    framebuffer.set_current_color(Color::GAINSBORO);
-    for j in (framebuffer.height / 2)..framebuffer.height {
-      framebuffer.set_pixel(i, j);
-    }
-  }
-
-  framebuffer.set_current_color(Color::WHITESMOKE);
-
-  for i in 0..num_rays {
-    let current_ray = i as f32 / num_rays as f32;
-    let a = player.a - (player.fov / 2.0) + (player.fov * current_ray);
-    let intersect = cast_ray(framebuffer, &maze, &player, a, block_size, false);
-
-    let distance_to_wall = intersect.distance;
-    let distance_to_projection_plane = 70.0;
-    let stake_height = (hh / distance_to_wall) * distance_to_projection_plane;
-
-    let stake_top = (hh - (stake_height / 2.0)) as usize;
-    let stake_bottom = (hh + (stake_height / 2.0)) as usize;
-
-    for y in stake_top..stake_bottom {
-      let ty = (y as f32 - stake_top as f32) / (stake_bottom as f32 - stake_top as f32) * 128.0;
-
-      let color = texture_cache.get_pixel_color(intersect.impact, intersect.tx as u32, ty as u32);
-      framebuffer.set_current_color(color);
-      framebuffer.set_pixel(i, y as u32);
-    }
-  }
-}
-
-fn render_enemies(framebuffer: &mut Framebuffer, player: &Player, texture_cache: &TextureManager) {
-  let enemies = vec![
-    Enemy::new(250.0, 250.0, 'e'),
-    // Enemy::new(450.0, 450.0, 'e'),
-    // Enemy::new(650.0, 650.0, 'e'),
-  ];
-
-  for enemy in &enemies {
-    draw_sprite(framebuffer, &player, enemy, texture_cache);
-  }
-}
-
 fn main() {
-  let window_width = 1300;
-  let window_height = 900;
-  let block_size = 100;
+    let window_width = 800;
+    let window_height = 600;
+    let framebuffer_width = 800;
+    let framebuffer_height = 600;
+    let frame_delay = Duration::from_millis(16);
 
-  let (mut window, raylib_thread) = raylib::init()
-    .size(window_width, window_height)
-    .title("Raycaster Example")
-    .log_level(TraceLogLevel::LOG_WARNING)
-    .build();
+    let mut framebuffer = Framebuffer::new(framebuffer_width, framebuffer_height);
+    let mut window = Window::new(
+        "Rust Graphics - Raytracer Example",
+        window_width,
+        window_height,
+        WindowOptions::default(),
+    ).unwrap();
 
-  let mut framebuffer = Framebuffer::new(window_width as u32, window_height as u32);
-  framebuffer.set_background_color(Color::new(50, 50, 100, 255));
+    // move the window around
+    window.set_position(500, 500);
+    window.update();
 
-  let maze = load_maze("maze.txt");
-  let mut player = Player {
-    pos: Vector2::new(150.0, 150.0),
-    a: PI / 3.0,
-    fov: PI / 3.0,
-  };
+    let rubber = Material::new(
+        Color::new(80, 0, 0),
+        1.0,
+        [0.9, 0.1],
+    );
 
-  // Initialize texture cache once
-  let texture_cache = TextureManager::new(&mut window, &raylib_thread);
+    let ivory = Material::new(
+        Color::new(100, 100, 80),
+        50.0,
+        [0.6, 0.3],
+    );
 
-  while !window.window_should_close() {
-    framebuffer.clear();
+    let objects = [
+        Sphere { center: Vec3::new(0.0, 0.0, 0.0), radius: 1.0, material: rubber },
+        Sphere { center: Vec3::new(0.0, 0.0, 1.5), radius: 0.5, material: ivory },
+        // Sphere { center: Vec3::new(1.0, 1.0, 3.0), radius: 0.7, material: rubber },
+        // Sphere { center: Vec3::new(-2.0, 2.0, -5.0), radius: 1.0, material: ivory },
+    ];
 
-    process_events(&mut player, &window);
+    // Initialize camera
+    let mut camera = Camera::new(
+        Vec3::new(0.0, 0.0, 5.0),  // eye: Initial camera position
+        Vec3::new(0.0, 0.0, 0.0),  // center: Point the camera is looking at (origin)
+        Vec3::new(0.0, 1.0, 0.0)   // up: World up vector
+    );
+    let rotation_speed = PI/50.0;
 
-    let mut mode = "3D";
+    let light = Light::new(
+        Vec3::new(0.0, 0.0, 5.0),
+        Color::new(255, 255, 255),
+        1.0
+    );
 
-    if window.is_key_down(KeyboardKey::KEY_M) {
-      mode = if mode == "2D" { "3D" } else { "2D" };
+    while window.is_open() {
+        // listen to inputs
+        if window.is_key_down(Key::Escape) {
+            break;
+        }
+
+        //  camera orbit controls
+        if window.is_key_down(Key::Left) {
+            camera.orbit(rotation_speed, 0.0);
+        }
+        if window.is_key_down(Key::Right) {
+            camera.orbit(-rotation_speed, 0.0);
+        }
+        if window.is_key_down(Key::Up) {
+            camera.orbit(0.0, -rotation_speed);
+        }
+        if window.is_key_down(Key::Down) {
+            camera.orbit(0.0, rotation_speed);
+        }
+
+        // draw some points
+        render(&mut framebuffer, &objects, &camera, &light);
+
+
+        // update the window with the framebuffer contents
+        window
+            .update_with_buffer(&framebuffer.buffer, framebuffer_width, framebuffer_height)
+            .unwrap();
+
+        std::thread::sleep(frame_delay);
     }
-
-    if mode == "2D" {
-      render_maze(&mut framebuffer, &maze, block_size, &player);
-    } else {
-      render_world(&mut framebuffer, &maze, block_size, &player, &texture_cache);
-      render_enemies(&mut framebuffer, &player, &texture_cache);
-    }
-
-    framebuffer.swap_buffers(&mut window, &raylib_thread);
-
-    thread::sleep(Duration::from_millis(16));
-  }
 }
