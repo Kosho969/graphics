@@ -1,219 +1,196 @@
-use nalgebra_glm::{Vec3, normalize};
-use minifb::{Key, Window, WindowOptions};
+// main.rs
+
+mod framebuffer;
+mod triangle;
+mod line;
+mod vertex;
+mod fragment;
+mod shaders;
+mod obj;
+mod matrix;
+
+use crate::matrix::new_matrix4;
+use framebuffer::Framebuffer;
+use vertex::Vertex;
+use triangle::triangle;
+use shaders::vertex_shader;
+use obj::Obj;
+use raylib::prelude::*;
+use std::thread;
 use std::time::Duration;
 use std::f32::consts::PI;
 
-mod framebuffer;
-mod ray_intersect;
-mod sphere; 
-mod color;
-mod camera;
-mod light;
-mod material;
-
-use framebuffer::Framebuffer;
-use sphere::Sphere;
-use color::Color;
-use ray_intersect::{Intersect, RayIntersect};
-use camera::Camera;
-use light::Light;
-use material::Material;
-
-const SHADOW_BIAS: f32 = 1e-4;
-
-fn reflect(incident: &Vec3, normal: &Vec3) -> Vec3 {
-    incident - 2.0 * incident.dot(normal) * normal
+pub struct Uniforms {
+    pub model_matrix: Matrix,
 }
 
-fn cast_shadow(
-    intersect: &Intersect,
-    light: &Light,
-    objects: &[Sphere],
-) -> f32 {
-    let light_dir = (light.position - intersect.point).normalize();
-    let light_distance = (light.position - intersect.point).magnitude();
+fn create_model_matrix(translation: Vector3, scale: f32, rotation: Vector3) -> Matrix {
+    let (sin_x, cos_x) = rotation.x.sin_cos();
+    let (sin_y, cos_y) = rotation.y.sin_cos();
+    let (sin_z, cos_z) = rotation.z.sin_cos();
 
-    let offset_normal = intersect.normal * SHADOW_BIAS;
-    let shadow_ray_origin = if light_dir.dot(&intersect.normal) < 0.0 {
-        intersect.point - offset_normal
-    } else {
-        intersect.point + offset_normal
-    };
+    // Rotation around the X-axis
+    let rotation_matrix_x = new_matrix4(
+        1.0, 0.0,    0.0,    0.0,
+        0.0, cos_x,  -sin_x, 0.0,
+        0.0, sin_x,  cos_x,  0.0,
+        0.0, 0.0,    0.0,    1.0
+    );
 
-    let mut shadow_intensity = 0.0;
+    // Rotation around the Y-axis
+    let rotation_matrix_y = new_matrix4(
+        cos_y,  0.0, sin_y, 0.0,
+        0.0,    1.0, 0.0,   0.0,
+        -sin_y, 0.0, cos_y, 0.0,
+        0.0,    0.0, 0.0,   1.0
+    );
 
-    for object in objects {
-        let shadow_intersect = object.ray_intersect(&shadow_ray_origin, &light_dir);
-        if shadow_intersect.is_intersecting && shadow_intersect.distance < light_distance {
-            let distance_ratio = shadow_intersect.distance / light_distance;
-            shadow_intensity = 1.0 - distance_ratio.powf(2.0).min(1.0);
-            break;
+    // Rotation around the Z-axis
+    let rotation_matrix_z = new_matrix4(
+        cos_z, -sin_z, 0.0, 0.0,
+        sin_z, cos_z,  0.0, 0.0,
+        0.0,   0.0,    1.0, 0.0,
+        0.0,   0.0,    0.0, 1.0
+    );
+
+    let rotation_matrix = rotation_matrix_z * rotation_matrix_y * rotation_matrix_x;
+
+    // Scaling matrix
+    let scale_matrix = new_matrix4(
+        scale, 0.0,   0.0,   0.0,
+        0.0,   scale, 0.0,   0.0,
+        0.0,   0.0,   scale, 0.0,
+        0.0,   0.0,   0.0,   1.0
+    );
+
+    // Translation matrix
+    let translation_matrix = new_matrix4(
+        1.0, 0.0, 0.0, translation.x,
+        0.0, 1.0, 0.0, translation.y,
+        0.0, 0.0, 1.0, translation.z,
+        0.0, 0.0, 0.0, 1.0
+    );
+
+    scale_matrix * rotation_matrix * translation_matrix
+}
+
+fn render(framebuffer: &mut Framebuffer, uniforms: &Uniforms, vertex_array: &[Vertex]) {
+    // Vertex Shader Stage
+    let mut transformed_vertices = Vec::with_capacity(vertex_array.len());
+    for vertex in vertex_array {
+        let transformed = vertex_shader(vertex, uniforms);
+        transformed_vertices.push(transformed);
+    }
+
+    // Log the first 3 transformed vertices for debugging
+    // println!("--- Transformed Vertices (first 3) ---");
+    // for i in 0..3.min(transformed_vertices.len()) {
+    //     println!("Vertex {}: {:?}", i, transformed_vertices[i].transformed_position);
+    // }
+
+    // Primitive Assembly Stage
+    let mut triangles = Vec::new();
+    for i in (0..transformed_vertices.len()).step_by(3) {
+        if i + 2 < transformed_vertices.len() {
+            triangles.push([
+                transformed_vertices[i].clone(),
+                transformed_vertices[i + 1].clone(),
+                transformed_vertices[i + 2].clone(),
+            ]);
         }
     }
 
-    shadow_intensity
-}
-
-pub fn cast_ray(
-    ray_origin: &Vec3,
-    ray_direction: &Vec3,
-    objects: &[Sphere],
-    light: &Light,
-) -> Color {
-    let mut intersect = Intersect::empty();
-    let mut zbuffer = f32::INFINITY;
-
-    for object in objects {
-        let i = object.ray_intersect(ray_origin, ray_direction);
-        if i.is_intersecting && i.distance < zbuffer {
-            zbuffer = i.distance;
-            intersect = i;
-        }
+    // Rasterization Stage
+    let mut fragments = Vec::new();
+    for tri in &triangles {
+        fragments.extend(triangle(&tri[0], &tri[1], &tri[2]));
     }
 
-    if !intersect.is_intersecting {
-        // return default sky box color
-        return Color::new(4, 12, 36);
-    }
-
-    let light_dir = (light.position - intersect.point).normalize();
-    let view_dir = (ray_origin - intersect.point).normalize();
-    let reflect_dir = reflect(&-light_dir, &intersect.normal);
-
-    let shadow_intensity = cast_shadow(&intersect, light, objects);
-    let light_intensity = light.intensity * (1.0 - shadow_intensity);
-
-    let diffuse_intensity = intersect.normal.dot(&light_dir).max(0.0).min(1.0);
-    let diffuse = intersect.material.diffuse * intersect.material.albedo[0] * diffuse_intensity * light_intensity;
-
-    let specular_intensity = view_dir.dot(&reflect_dir).max(0.0).powf(intersect.material.specular);
-    let specular = light.color * intersect.material.albedo[1] * specular_intensity * light_intensity;
-
-    diffuse + specular
-}
-
-pub fn render(framebuffer: &mut Framebuffer, objects: &[Sphere], camera: &Camera, light: &Light) {
-    let width = framebuffer.width as f32;
-    let height = framebuffer.height as f32;
-    let aspect_ratio = width / height;
-    let fov = PI/3.0;
-    let perspective_scale = (fov * 0.5).tan();
-
-    // random number generator
-    // let mut rng = rand::thread_rng();
-
-    for y in 0..framebuffer.height {
-        for x in 0..framebuffer.width {
-            // if rng.gen_range(0.0..1.0) < 0.3 {
-            //     // we skip 30% of the points
-            //     continue;
-            // }
-
-            // Map the pixel coordinate to screen space [-1, 1]
-            let screen_x = (2.0 * x as f32) / width - 1.0;
-            let screen_y = -(2.0 * y as f32) / height + 1.0;
-
-            // Adjust for aspect ratio and perspective 
-            let screen_x = screen_x * aspect_ratio * perspective_scale;
-            let screen_y = screen_y * perspective_scale;
-
-            // Calculate the direction of the ray for this pixel
-            let ray_direction = normalize(&Vec3::new(screen_x, screen_y, -1.0));
-
-            // Apply camera rotation to the ray direction
-            let rotated_direction = camera.basis_change(&ray_direction);
-
-            // Cast the ray and get the pixel color
-            let pixel_color = cast_ray(&camera.eye, &rotated_direction, objects, light);
-
-            // Draw the pixel on screen with the returned color
-            framebuffer.set_current_color(pixel_color.to_hex());
-            framebuffer.point(x, y);
-        }
+    // Fragment Processing Stage
+    for fragment in fragments {
+        framebuffer.point(
+            fragment.position.x as i32,
+            fragment.position.y as i32,
+            fragment.color
+        );
     }
 }
 
 fn main() {
     let window_width = 800;
     let window_height = 600;
-    let framebuffer_width = 800;
-    let framebuffer_height = 600;
-    let frame_delay = Duration::from_millis(16);
 
-    let mut framebuffer = Framebuffer::new(framebuffer_width, framebuffer_height);
-    let mut window = Window::new(
-        "Rust Graphics - Raytracer Example",
-        window_width,
-        window_height,
-        WindowOptions::default(),
-    ).unwrap();
+    let (mut window, thread) = raylib::init()
+        .size(window_width, window_height)
+        .title("Rust Graphics - Renderer Example")
+        .log_level(TraceLogLevel::LOG_WARNING) // Suppress INFO messages
+        .build();
 
-    // move the window around
-    window.set_position(500, 500);
-    window.update();
+    let mut framebuffer = Framebuffer::new(window_width as u32, window_height as u32);
+    framebuffer.set_background_color(Vector3::new(0.2, 0.2, 0.4)); // Dark blue-ish
 
-    let rubber = Material::new(
-        Color::new(80, 0, 0),
-        1.0,
-        [0.9, 0.1],
-    );
+    // Initialize the texture inside the framebuffer
+    framebuffer.init_texture(&mut window, &thread);
 
-    let ivory = Material::new(
-        Color::new(100, 100, 80),
-        50.0,
-        [0.6, 0.3],
-    );
+    let mut translation = Vector3::new(300.0, 300.0, 0.0);
+    let mut rotation = Vector3::new(0.0, 0.0, 0.0);
+    let mut scale = 50.0f32; // Set scale to 1.2
 
-    let objects = [
-        Sphere { center: Vec3::new(0.0, 0.0, 0.0), radius: 1.0, material: rubber },
-        Sphere { center: Vec3::new(0.0, 0.0, 1.5), radius: 0.5, material: ivory },
-        // Sphere { center: Vec3::new(1.0, 1.0, 3.0), radius: 0.7, material: rubber },
-        // Sphere { center: Vec3::new(-2.0, 2.0, -5.0), radius: 1.0, material: ivory },
-    ];
+    let obj = Obj::load("assets/models/anya.obj").expect("Failed to load obj");
+    let vertex_array = obj.get_vertex_array();
 
-    // Initialize camera
-    let mut camera = Camera::new(
-        Vec3::new(0.0, 0.0, 5.0),  // eye: Initial camera position
-        Vec3::new(0.0, 0.0, 0.0),  // center: Point the camera is looking at (origin)
-        Vec3::new(0.0, 1.0, 0.0)   // up: World up vector
-    );
-    let rotation_speed = PI/50.0;
+    while !window.window_should_close() {
+        handle_input(&mut window, &mut translation, &mut rotation, &mut scale);
 
-    let light = Light::new(
-        Vec3::new(0.0, 0.0, 5.0),
-        Color::new(255, 255, 255),
-        1.0
-    );
+        framebuffer.clear();
 
-    while window.is_open() {
-        // listen to inputs
-        if window.is_key_down(Key::Escape) {
-            break;
-        }
+        let model_matrix = create_model_matrix(translation, scale, rotation);
+        let uniforms = Uniforms { model_matrix };
 
-        //  camera orbit controls
-        if window.is_key_down(Key::Left) {
-            camera.orbit(rotation_speed, 0.0);
-        }
-        if window.is_key_down(Key::Right) {
-            camera.orbit(-rotation_speed, 0.0);
-        }
-        if window.is_key_down(Key::Up) {
-            camera.orbit(0.0, -rotation_speed);
-        }
-        if window.is_key_down(Key::Down) {
-            camera.orbit(0.0, rotation_speed);
-        }
+        render(&mut framebuffer, &uniforms, &vertex_array);
 
-        // draw some points
-        render(&mut framebuffer, &objects, &camera, &light);
+        // Call the encapsulated swap_buffers function
+        framebuffer.swap_buffers(&mut window, &thread);
 
+        thread::sleep(Duration::from_millis(16));
+    }
+}
 
-        // update the window with the framebuffer contents
-        window
-            .update_with_buffer(&framebuffer.buffer, framebuffer_width, framebuffer_height)
-            .unwrap();
-
-        std::thread::sleep(frame_delay);
+fn handle_input(window: &mut RaylibHandle, translation: &mut Vector3, rotation: &mut Vector3, scale: &mut f32) {
+    if window.is_key_down(KeyboardKey::KEY_RIGHT) {
+        translation.x += 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_LEFT) {
+        translation.x -= 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_UP) {
+        translation.y -= 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_DOWN) {
+        translation.y += 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_S) {
+        *scale += 0.1;
+    }
+    if window.is_key_down(KeyboardKey::KEY_A) {
+        *scale -= 0.1;
+    }
+    if window.is_key_down(KeyboardKey::KEY_Q) {
+        rotation.x -= PI / 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_W) {
+        rotation.x += PI / 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_E) {
+        rotation.y -= PI / 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_R) {
+        rotation.y += PI / 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_T) {
+        rotation.z -= PI / 10.0;
+    }
+    if window.is_key_down(KeyboardKey::KEY_Y) {
+        rotation.z += PI / 10.0;
     }
 }
